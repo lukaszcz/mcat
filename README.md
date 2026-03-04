@@ -29,7 +29,7 @@ or ~
 ```sh
 git clone https://github.com/Skardyy/mcat
 cd mcat
-cargo install --path ./crates/core
+cargo install --path .
 ```
 
 </details>
