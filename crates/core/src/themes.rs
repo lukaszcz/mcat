@@ -2,6 +2,48 @@ use std::str::FromStr;
 
 use syntect::highlighting::{Color, ScopeSelectors, StyleModifier, Theme, ThemeSettings};
 
+use crate::config;
+
+fn lighten_hex(hex: &str, factor: f32) -> String {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return format!("#{hex}");
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+    let blend = |c: u8| (c as f32 + (255.0 - c as f32) * factor).round() as u8;
+    format!("#{:02X}{:02X}{:02X}", blend(r), blend(g), blend(b))
+}
+
+fn darken_hex(hex: &str, factor: f32) -> String {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return format!("#{hex}");
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+    let scale = |c: u8| (c as f32 * factor).round() as u8;
+    format!("#{:02X}{:02X}{:02X}", scale(r), scale(g), scale(b))
+}
+
+fn readable_on(hex: &str) -> String {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return "#000000".to_string();
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0) as f32;
+    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0) as f32;
+    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0) as f32;
+    let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    if lum > 140.0 {
+        "#000000".to_string()
+    } else {
+        "#FFFFFF".to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ThemeColor {
     value: String,
@@ -12,7 +54,7 @@ pub struct ThemeColor {
 
 impl From<&str> for ThemeColor {
     fn from(hex_color: &str) -> Self {
-        let color = hex_to_rgba(&hex_color);
+        let color = hex_to_rgba(hex_color);
         let (r, g, b) = (color.r, color.g, color.b);
 
         ThemeColor {
@@ -24,38 +66,31 @@ impl From<&str> for ThemeColor {
     }
 }
 
-impl From<&str> for CustomTheme {
-    fn from(s: &str) -> Self {
+impl From<&config::Theme> for CustomTheme {
+    fn from(s: &config::Theme) -> Self {
         match s {
-            "catppuccin" => CustomTheme::catppuccin(),
-            "nord" => CustomTheme::nord(),
-            "monokai" => CustomTheme::monokai(),
-            "dracula" => CustomTheme::dracula(),
-            "gruvbox" => CustomTheme::gruvbox(),
-            "one_dark" => CustomTheme::one_dark(),
-            "solarized" => CustomTheme::solarized(),
-            "tokyo_night" => CustomTheme::tokyo_night(),
-            "makurai_light" => CustomTheme::makurai_light(),
-            "makurai_dark" => CustomTheme::makurai_dark(),
-            "ayu" => CustomTheme::ayu(),
-            "ayu_mirage" => CustomTheme::ayu_mirage(),
-            "github" => CustomTheme::github(),
-            "synthwave" => CustomTheme::synthwave(),
-            "material" => CustomTheme::material(),
-            "rose_pine" => CustomTheme::rose_pine(),
-            "kanagawa" => CustomTheme::kanagawa(),
-            "vscode" => CustomTheme::vscode(),
-            "everforest" => CustomTheme::everforest(),
-            "autumn" => CustomTheme::autumn(),
-            "spring" => CustomTheme::spring(),
-            _ => CustomTheme::github(),
+            config::Theme::Catppuccin => CustomTheme::catppuccin(),
+            config::Theme::Nord => CustomTheme::nord(),
+            config::Theme::Monokai => CustomTheme::monokai(),
+            config::Theme::Dracula => CustomTheme::dracula(),
+            config::Theme::Gruvbox => CustomTheme::gruvbox(),
+            config::Theme::OneDark => CustomTheme::one_dark(),
+            config::Theme::Solarized => CustomTheme::solarized(),
+            config::Theme::TokyoNight => CustomTheme::tokyo_night(),
+            config::Theme::MakuraiLight => CustomTheme::makurai_light(),
+            config::Theme::MakuraiDark => CustomTheme::makurai_dark(),
+            config::Theme::Ayu => CustomTheme::ayu(),
+            config::Theme::AyuMirage => CustomTheme::ayu_mirage(),
+            config::Theme::Github => CustomTheme::github(),
+            config::Theme::Synthwave => CustomTheme::synthwave(),
+            config::Theme::Material => CustomTheme::material(),
+            config::Theme::RosePine => CustomTheme::rose_pine(),
+            config::Theme::Kanagawa => CustomTheme::kanagawa(),
+            config::Theme::Vscode => CustomTheme::vscode(),
+            config::Theme::Everforest => CustomTheme::everforest(),
+            config::Theme::Autumn => CustomTheme::autumn(),
+            config::Theme::Spring => CustomTheme::spring(),
         }
-    }
-}
-
-impl From<String> for CustomTheme {
-    fn from(s: String) -> Self {
-        CustomTheme::from(s.as_ref())
     }
 }
 
@@ -79,9 +114,8 @@ pub struct CustomTheme {
     pub blue: ThemeColor,
     pub cyan: ThemeColor,
     pub yellow: ThemeColor,
+    pub magenta: ThemeColor,
 
-    #[allow(dead_code)]
-    magenta: ThemeColor,
     #[allow(dead_code)]
     white: ThemeColor,
     pub black: ThemeColor,
@@ -641,11 +675,104 @@ impl CustomTheme {
         }
     }
 
+    pub fn to_mermaid_theme(&self) -> mermaid_rs_renderer::Theme {
+        let mut t = mermaid_rs_renderer::Theme::modern();
+
+        t.primary_color = self.surface.value.clone();
+        t.secondary_color = self.keyword_bg.value.clone();
+        t.tertiary_color = self.background.value.clone();
+        t.primary_text_color = self.foreground.value.clone();
+        t.primary_border_color = self.border.value.clone();
+        t.line_color = self.foreground.value.clone();
+        t.edge_label_background = self.background.value.clone();
+        t.cluster_background = self.background.value.clone();
+        t.cluster_border = self.border.value.clone();
+        t.background = "#FFFFFF00".to_owned();
+
+        t.sequence_actor_fill = self.surface.value.clone();
+        t.sequence_actor_border = self.border.value.clone();
+        t.sequence_actor_line = self.comment.value.clone();
+        t.sequence_note_fill = self.keyword_bg.value.clone();
+        t.sequence_note_border = self.yellow.value.clone();
+        t.sequence_activation_fill = self.surface.value.clone();
+        t.sequence_activation_border = self.border.value.clone();
+
+        t.text_color = self.foreground.value.clone();
+
+        t.git_colors = [
+            self.red.value.clone(),
+            self.blue.value.clone(),
+            self.green.value.clone(),
+            self.yellow.value.clone(),
+            self.magenta.value.clone(),
+            self.cyan.value.clone(),
+            darken_hex(&self.red.value, 0.65),
+            darken_hex(&self.blue.value, 0.65),
+        ];
+        t.git_inv_colors = [
+            lighten_hex(&self.red.value, 0.6),
+            lighten_hex(&self.blue.value, 0.6),
+            lighten_hex(&self.green.value, 0.6),
+            lighten_hex(&self.yellow.value, 0.6),
+            lighten_hex(&self.magenta.value, 0.6),
+            lighten_hex(&self.cyan.value, 0.6),
+            lighten_hex(&darken_hex(&self.red.value, 0.65), 0.6),
+            lighten_hex(&darken_hex(&self.blue.value, 0.65), 0.6),
+        ];
+        t.git_branch_label_colors = [
+            readable_on(&t.git_colors[0]),
+            readable_on(&t.git_colors[1]),
+            readable_on(&t.git_colors[2]),
+            readable_on(&t.git_colors[3]),
+            readable_on(&t.git_colors[4]),
+            readable_on(&t.git_colors[5]),
+            readable_on(&t.git_colors[6]),
+            readable_on(&t.git_colors[7]),
+        ];
+        t.git_commit_label_color = self.foreground.value.clone();
+        t.git_commit_label_background = self.surface.value.clone();
+        t.git_tag_label_color = self.foreground.value.clone();
+        t.git_tag_label_background = self.surface.value.clone();
+        t.git_tag_label_border = self.border.value.clone();
+
+        t.pie_title_text_color = self.foreground.value.clone();
+        t.pie_section_text_color = self.foreground.value.clone();
+        t.pie_legend_text_color = self.foreground.value.clone();
+        t.pie_stroke_color = self.background.value.clone();
+        t.pie_outer_stroke_color = self.border.value.clone();
+        let base = [
+            &self.red.value,
+            &self.blue.value,
+            &self.green.value,
+            &self.yellow.value,
+            &self.magenta.value,
+            &self.cyan.value,
+        ];
+        t.pie_colors = [
+            lighten_hex(base[0], 0.45),
+            darken_hex(base[0], 0.65),
+            lighten_hex(base[1], 0.45),
+            darken_hex(base[1], 0.65),
+            lighten_hex(base[2], 0.45),
+            darken_hex(base[2], 0.65),
+            lighten_hex(base[3], 0.45),
+            darken_hex(base[3], 0.65),
+            lighten_hex(base[4], 0.45),
+            darken_hex(base[4], 0.65),
+            lighten_hex(base[5], 0.45),
+            darken_hex(base[5], 0.65),
+        ];
+
+        t
+    }
+
     pub fn to_syntect_theme(&self) -> Theme {
-        let mut settings = ThemeSettings::default();
-        settings.foreground = Some(self.foreground.color);
-        settings.background = Some(self.surface.color);
-        settings.guide = Some(self.guide.color);
+        let settings = ThemeSettings {
+            foreground: Some(self.foreground.color),
+            background: Some(self.surface.color),
+            guide: Some(self.guide.color),
+            ..Default::default()
+        };
 
         let mut theme = Theme {
             name: None,
@@ -719,6 +846,7 @@ impl CustomTheme {
   --constant: {};
   --comment: {};
   --foreground: {};
+  --highlight: {};
   
   /* UI Colors */
   --background: {};
@@ -732,11 +860,12 @@ impl CustomTheme {
             self.constant.value,
             self.comment.value,
             self.foreground.value,
+            self.yellow.value,
             self.background.value,
             self.surface.value,
             self.border.value
         );
-        let full_css = include_str!("../../assets/style.css");
+        let full_css = include_str!("../assets/style.css");
         format!("{full_css}\n\n{root_css}")
     }
 }

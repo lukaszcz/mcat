@@ -2,15 +2,25 @@ use comrak::nodes::{
     AstNode, NodeCode, NodeHeading, NodeHtmlBlock, NodeMath, NodeValue, NodeWikiLink,
 };
 use itertools::Itertools;
+use rasteroid::term_misc::Wininfo;
 use regex::Regex;
+use strip_ansi_escapes::strip_str;
 use syntect::parsing::SyntaxSet;
 
-use crate::markdown_viewer::utils::{string_len, trim_ansi_string, wrap_lines};
+use crate::{
+    markdown_viewer::utils::{
+        extract_span_color, prettify_latex, string_len, to_superscript, trim_ansi_string,
+        wrap_lines,
+    },
+    themes::CustomTheme,
+};
 
 use super::{
     image_preprocessor::ImagePreprocessor,
-    themes::CustomTheme,
-    utils::{format_code_box, format_code_full, format_code_simple, format_tb, wrap_char_based},
+    utils::{
+        format_code_box, format_code_full, format_code_simple, format_tb, wrap_char_based,
+        wrap_highlighted_line,
+    },
 };
 
 pub const RESET: &str = "\x1B[0m";
@@ -25,25 +35,23 @@ const STRIKETHROUGH_OFF: &str = "\x1B[29m";
 pub const UNDERLINE_OFF: &str = "\x1B[24m";
 const INDENT: usize = 2;
 
-pub struct AnsiContext<'a> {
+pub struct AnsiContext {
     pub ps: SyntaxSet,
     pub theme: CustomTheme,
+    pub wininfo: Wininfo,
     pub hide_line_numbers: bool,
     pub show_frontmatter: bool,
     pub center: bool,
-    pub term_width: usize,
-    pub image_preprocessor: &'a ImagePreprocessor,
+    pub image_preprocessor: ImagePreprocessor,
 
     pub blockquote_fenced_offset: Option<usize>,
-    pub is_multi_block_quote: bool,
-    pub paragraph_collecting_line: Option<usize>,
     pub collecting_depth: usize,
     pub under_header: bool,
     pub force_simple_code_block: usize,
     pub list_depth: usize,
 }
 
-impl<'a> AnsiContext<'a> {
+impl AnsiContext {
     pub fn should_wrap(&self) -> bool {
         // root level element
         self.collecting_depth == 0
@@ -64,10 +72,24 @@ fn collect<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext, sep: &str) -> Strin
     content
 }
 
+fn center_lines(text: &str, start_col: usize, sc_width: u16) -> String {
+    text.lines()
+        .map(|line| {
+            let line = trim_ansi_string(line.into());
+            let le = string_len(&line);
+            let offset = start_col.saturating_sub(1);
+            let offset = (sc_width as usize - offset)
+                .saturating_sub(le)
+                .saturating_div(2);
+            format!("{}{line}", " ".repeat(offset))
+        })
+        .join("\n")
+}
+
 pub fn parse_node<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let data = node.data.borrow();
 
-    let content = match &data.value {
+    match &data.value {
         NodeValue::Document => render_document(node, ctx),
         NodeValue::FrontMatter(_) => render_front_matter(node, ctx),
         NodeValue::BlockQuote => render_block_quote(node, ctx),
@@ -92,31 +114,29 @@ pub fn parse_node<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
         NodeValue::WikiLink(_) => render_wiki_link(node, ctx),
         NodeValue::SpoileredText => render_spoilered_text(node, ctx),
         NodeValue::Alert(_) => render_alert(node, ctx),
+        NodeValue::BlockDirective(_) => render_block_directive(node, ctx),
         NodeValue::FootnoteDefinition(_) => render_footnote_def(node, ctx),
         NodeValue::FootnoteReference(_) => render_footnote_ref(node, ctx),
+        NodeValue::Highlight => render_highlight(node, ctx),
+        NodeValue::DescriptionList => render_description_list(node, ctx),
+        NodeValue::DescriptionItem(_) => render_description_item(node, ctx),
+        NodeValue::DescriptionTerm => render_description_term(node, ctx),
+        NodeValue::DescriptionDetails => render_description_details(node, ctx),
+        NodeValue::Math(_) => render_math(node, ctx),
         NodeValue::Text(literal) => literal.to_string(),
         NodeValue::Raw(literal) => literal.to_owned(),
-        NodeValue::Math(NodeMath { literal, .. }) => literal.to_owned(),
+        NodeValue::ShortCode(sc) => sc.emoji.to_string(),
         NodeValue::SoftBreak => " ".to_owned(),
         NodeValue::LineBreak => "\n".to_owned(),
-        NodeValue::TableRow(_) => String::new(),
-        NodeValue::TableCell => String::new(),
-        NodeValue::Escaped => String::new(),
-        NodeValue::DescriptionList => String::new(),
-        NodeValue::DescriptionItem(_) => String::new(),
-        NodeValue::DescriptionTerm => String::new(),
-        NodeValue::DescriptionDetails => String::new(),
-        NodeValue::EscapedTag(_) => String::new(),
-        NodeValue::Underline => String::new(),
-        NodeValue::Subscript => String::new(),
-        NodeValue::HeexBlock(_) => String::new(),
-        NodeValue::HeexInline(_) => String::new(),
-        NodeValue::Highlight => String::new(),
-        NodeValue::ShortCode(_) => String::new(),
-        NodeValue::Subtext => String::new(),
-    };
-
-    content
+        NodeValue::TableRow(_) => String::new(), // handled in table
+        NodeValue::TableCell => String::new(),   // handled in table
+        NodeValue::Escaped => String::new(),     // feature not enabled per char
+        NodeValue::EscapedTag(_) => String::new(), // i think its only html
+        NodeValue::Underline => String::new(),   // feature not enabled, collison
+        NodeValue::Subscript => String::new(),   // feature not enabled, collison
+        NodeValue::Subtext => String::new(),     // too niche, not enabled
+        NodeValue::Insert => String::new(),      // too niche, not enabled
+    }
 }
 
 fn render_document<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
@@ -124,6 +144,48 @@ fn render_document<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
         .map(|child| parse_node(child, ctx))
         .filter(|s| !s.is_empty())
         .join("\n\n")
+}
+
+fn render_math<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    let NodeValue::Math(NodeMath {
+        ref literal,
+        display_math,
+        ..
+    }) = node.data.borrow().value
+    else {
+        panic!()
+    };
+
+    let out = prettify_latex(literal.trim(), ctx);
+
+    if !display_math {
+        return out;
+    }
+
+    if ctx.should_wrap() {
+        let pad = " ".repeat(ctx.indent());
+        out.lines().map(|l| format!("{pad}{l}")).join("\n")
+    } else {
+        out
+    }
+}
+
+fn render_description_list<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    collect(node, ctx, "\n\n")
+}
+
+fn render_description_item<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    collect(node, ctx, "\n")
+}
+
+fn render_description_term<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    let content = collect(node, ctx, "").replace(RESET, &format!("{RESET}{BOLD}"));
+    format!("{BOLD}{content}{NORMAL}")
+}
+
+fn render_description_details<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    let content = collect(node, ctx, "");
+    content.lines().map(|l| format!("  {l}")).join("\n")
 }
 
 fn render_front_matter<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
@@ -161,7 +223,7 @@ fn render_footnote_def<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> Stri
         .map(|line| {
             let indent = ctx.indent();
             if ctx.should_wrap() {
-                wrap_lines(&line, false, indent, "", "")
+                wrap_lines(ctx, line, false, indent, "", "", false)
             } else {
                 line.into()
             }
@@ -181,28 +243,27 @@ fn render_footnote_ref<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> Stri
 fn render_block_quote<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let guide = ctx.theme.guide.fg.clone();
     let comment = ctx.theme.comment.fg.clone();
+    let offset = 4 + ctx.indent() as u16 * 2;
 
     ctx.force_simple_code_block += 1;
+    ctx.wininfo.sc_width -= offset;
     let content = collect(node, ctx, "\n\n").replace(RESET, &format!("{RESET}{comment}"));
+    ctx.wininfo.sc_width += offset;
     ctx.force_simple_code_block -= 1;
     let fence_offset = ctx.blockquote_fenced_offset.unwrap_or_default();
 
+    let offset = " ".repeat(fence_offset + 1);
     let content = content
         .lines()
-        .map(|line| {
-            let offset = " ".repeat(fence_offset + 1);
-            format!("{guide}▌{offset}{comment}{line}{RESET}")
-        })
+        .map(|line| format!("{guide}▌{offset}{comment}{line}{RESET}"))
         .join("\n");
 
     let indent = ctx.indent();
-    let content = if ctx.should_wrap() {
-        wrap_char_based(&content, '▌', indent, "", "")
+    if ctx.should_wrap() {
+        wrap_char_based(ctx, &content, '▌', indent, "", "")
     } else {
         content.to_owned()
-    };
-
-    content
+    }
 }
 
 fn render_list<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
@@ -215,31 +276,60 @@ fn render_list<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let content = collect(node, ctx, sep);
     ctx.list_depth -= 1;
 
-    let indent = ctx.indent();
-    let content = if ctx.should_wrap() {
-        wrap_lines(&content, true, indent, "", "  ") // 2 space extra because of the bullet
-    } else {
-        content
-    };
+    // we indent sub lines based on the length of the bullet
+    let sub_prefix = content
+        .lines()
+        .next()
+        .map(|line| {
+            strip_str(line)
+                .trim()
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .count()
+                + 1
+        })
+        .unwrap_or(2);
+    let sub_prefix = " ".repeat(sub_prefix);
 
-    content
+    let indent = ctx.indent();
+    wrap_lines(ctx, &content, true, indent, "", &sub_prefix, true)
 }
 
 fn render_item<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let NodeValue::Item(ref item) = node.data.borrow().value else {
         panic!()
     };
+    let offset = 4 + ctx.indent() as u16 * 2;
 
     let yellow = ctx.theme.yellow.fg.clone();
-    let content = collect(node, ctx, "");
-    let content = content.trim();
+    ctx.wininfo.sc_width -= offset;
+    let content = collect(node, ctx, "\n");
+    ctx.wininfo.sc_width += offset;
+    let content = trim_ansi_string(content);
     let depth = ctx.list_depth - 1;
 
     let bullets = ["●", "○", "◆", "◇"];
     let bullet = match item.list_type {
         comrak::nodes::ListType::Bullet => bullets[depth % 4],
-        comrak::nodes::ListType::Ordered => &format!("{}.", item.start),
+        comrak::nodes::ListType::Ordered => {
+            let base = node
+                .parent()
+                .and_then(|p| match p.data.borrow().value {
+                    NodeValue::List(ref l) => Some(l.start),
+                    _ => None,
+                })
+                .unwrap_or(item.start);
+            let index = node
+                .parent()
+                .map(|p| p.children().take_while(|c| !std::ptr::eq(*c, node)).count())
+                .unwrap_or(0);
+            &format!("{}.", base + index)
+        }
     };
+
+    // indent new lines to allign with the first line
+    let bullet_count = bullet.chars().count() + 1;
+    let content = content.replace("\n", &format!("\n{}", " ".repeat(bullet_count)));
 
     format!("{}{yellow}{bullet}{RESET} {content}", " ".repeat(depth * 4))
 }
@@ -250,7 +340,7 @@ fn render_task_item<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String 
     };
 
     let offset = " ".repeat(node.data.borrow().sourcepos.start.column - 1);
-    let content = collect(node, ctx, "");
+    let content = collect(node, ctx, "\n\n");
     let content = content.trim();
     let (icon, colour) = match task.symbol.map(|c| c.to_ascii_lowercase()) {
         Some('x') => ("󰱒", &ctx.theme.green.fg),
@@ -269,10 +359,29 @@ fn render_code_block<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String
     let literal = &node_code_block.literal;
     let info = &node_code_block.info;
 
-    let info = if info.trim().is_empty() { "text" } else { info };
+    let info = if info.trim().is_empty() {
+        "text"
+    } else if let Some(inner) = info.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        inner
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("text")
+    } else {
+        info
+    };
 
-    // force_simple_code_block is a number because it may be recursive
-    if info == "file-tree" {
+    if matches!(info, "mermaid" | "mmd")
+        && let Some(img) = ctx.image_preprocessor.mapper.get(literal)
+        && img.is_ok
+    {
+        let placeholder = &img.placeholder;
+        if ctx.center {
+            let sps = node.data.borrow().sourcepos;
+            return center_lines(placeholder, sps.start.column, ctx.wininfo.sc_width);
+        }
+        placeholder.clone()
+    } else if info == "file-tree" {
         render_file_tree(literal, ctx)
     } else if literal.lines().count() <= 10
         || ctx.force_simple_code_block > 0
@@ -289,10 +398,12 @@ fn render_file_tree(tree: &str, ctx: &mut AnsiContext) -> String {
     let tree_chars = Regex::new(r"[│├└─]").unwrap();
     let folders = Regex::new(r"([a-zA-Z0-9_\-]+/)").unwrap();
     let files = Regex::new(r"([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)").unwrap();
+    let urls = Regex::new(r"https?://[^\s]+").unwrap();
 
     let tree_char_color = &ctx.theme.guide.fg;
     let folder_color = &ctx.theme.blue.fg;
     let file_color = &ctx.theme.foreground.fg;
+    let url_color = &ctx.theme.magenta.fg;
 
     let mut result = tree.trim().to_string();
 
@@ -302,17 +413,32 @@ fn render_file_tree(tree: &str, ctx: &mut AnsiContext) -> String {
         })
         .to_string();
 
-    result = folders
-        .replace_all(&result, |caps: &regex::Captures| {
-            format!("{folder_color}{}{RESET}", &caps[1])
+    result = result
+        .lines()
+        .map(|line| {
+            let mut l = line.to_string();
+            if urls.is_match(line) {
+                l = urls
+                    .replace_all(&l, |caps: &regex::Captures| {
+                        format!("{url_color}{}{RESET}", &caps[0])
+                    })
+                    .to_string();
+            } else {
+                l = folders
+                    .replace_all(&l, |caps: &regex::Captures| {
+                        format!("{folder_color}{}{RESET}", &caps[1])
+                    })
+                    .to_string();
+                l = files
+                    .replace_all(&l, |caps: &regex::Captures| {
+                        format!("{file_color}{}{RESET}", &caps[1])
+                    })
+                    .to_string();
+            }
+            l
         })
-        .to_string();
-
-    result = files
-        .replace_all(&result, |caps: &regex::Captures| {
-            format!("{file_color}{}{RESET}", &caps[1])
-        })
-        .to_string();
+        .collect::<Vec<_>>()
+        .join("\n");
 
     result
 }
@@ -336,38 +462,22 @@ fn render_html_block<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String
         .lines()
         .map(|line| format!("{comment}{line}{RESET}"))
         .join("\n");
-    let result = wrap_lines(&result, true, INDENT, "", "");
-
-    result
+    wrap_lines(ctx, &result, true, INDENT, "", "", false)
 }
 
 fn render_paragraph<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let sps = node.data.borrow().sourcepos;
-    ctx.paragraph_collecting_line = Some(sps.start.line);
     let lines = collect(node, ctx, "");
-    ctx.paragraph_collecting_line = None;
 
     if ctx.center {
-        lines
-            .lines()
-            .map(|line| {
-                let line = trim_ansi_string(line.into());
-                let le = string_len(&line);
-                // 1 based index
-                let offset = sps.start.column.saturating_sub(1);
-                let offset = (ctx.term_width - offset)
-                    .saturating_sub(le)
-                    .saturating_div(2);
-                format!("{}{line}", " ".repeat(offset))
-            })
-            .join("\n")
+        center_lines(&lines, sps.start.column, ctx.wininfo.sc_width)
     } else {
         lines
             .lines()
             .map(|line| {
                 let indent = ctx.indent();
                 if ctx.should_wrap() {
-                    wrap_lines(&line, false, indent, "", "")
+                    wrap_lines(ctx, line, false, indent, "", "", false)
                 } else {
                     line.into()
                 }
@@ -383,7 +493,7 @@ fn render_heading<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
 
     ctx.under_header = true;
     let content = collect(node, ctx, "");
-    let content = content.trim();
+    let content = trim_ansi_string(content);
     let content = match level {
         1 => format!(" 󰎤 {content}"),
         2 => format!(" 󰎧 {content}"),
@@ -397,17 +507,18 @@ fn render_heading<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let main_color = &ctx.theme.keyword.fg;
     let content = content.replace(RESET, &format!("{RESET}{bg}"));
 
-    let header = if !ctx.center {
+    if !ctx.center {
         let padding = " ".repeat(
-            ctx.term_width
-                .saturating_sub(string_len(&content) as usize)
+            ctx.wininfo
+                .sc_width
+                .saturating_sub(string_len(&content) as u16)
                 .into(),
         );
         format!("{main_color}{bg}{content}{padding}{RESET}")
     } else {
         // center here
         let le = string_len(&content);
-        let left_space = ctx.term_width.saturating_sub(le);
+        let left_space = (ctx.wininfo.sc_width as usize).saturating_sub(le);
         let padding_left = left_space.saturating_div(2);
         let padding_rigth = left_space - padding_left;
         format!(
@@ -415,16 +526,11 @@ fn render_heading<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
             " ".repeat(padding_left),
             " ".repeat(padding_rigth)
         )
-    };
-
-    header
+    }
 }
 
-fn render_thematic_break<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
-    let offset = node.data.borrow().sourcepos.start.column;
-    // each level of blockquote adds 4 char prefix..
-    let extra_offset = ctx.force_simple_code_block * 4;
-    format_tb(ctx, offset + extra_offset)
+fn render_thematic_break<'a>(_node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    format_tb(ctx, 0)
 }
 
 fn render_table<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
@@ -443,8 +549,10 @@ fn render_table<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
 
         for cell_node in child.children() {
             let cell_content = collect(cell_node, ctx, "");
-            let cell_lines: Vec<String> =
-                cell_content.lines().map(|s| s.trim().to_string()).collect();
+            let cell_lines: Vec<String> = cell_content
+                .lines()
+                .map(|s| trim_ansi_string(s.to_string()))
+                .collect();
             max_lines_in_row = max_lines_in_row.max(cell_lines.len());
             row_cells.push(cell_lines);
         }
@@ -462,6 +570,96 @@ fn render_table<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
                 column_widths[i] = max_width_in_cell;
             }
         }
+    }
+
+    // Cap column widths to fit within available terminal width.
+    // Match the three-way branch in the existing post-render offset logic:
+    // centered uses source-position offset, indented uses ctx.indent(),
+    // default uses full width.
+    let available_width = if ctx.center {
+        let offset = node.data.borrow().sourcepos.start.column.saturating_sub(1);
+        (ctx.wininfo.sc_width as usize).saturating_sub(offset)
+    } else if ctx.should_wrap() {
+        (ctx.wininfo.sc_width as usize).saturating_sub(ctx.indent())
+    } else {
+        ctx.wininfo.sc_width as usize
+    };
+
+    let border_overhead = 3 * column_widths.len() + 1;
+    let total_content_width: usize = column_widths.iter().sum();
+    let total_table_width = total_content_width + border_overhead;
+
+    if total_table_width > available_width && total_content_width > 0 {
+        let target_content_width = available_width.saturating_sub(border_overhead);
+        // Waterfall algorithm: keep narrow columns at their natural width,
+        // shrink only the wider columns. Iterate from narrowest to widest:
+        // if a column fits within its equal share of remaining space, grant
+        // it its natural width; otherwise distribute remaining space equally
+        // among the remaining (wider) columns.
+        let mut indices: Vec<usize> = (0..column_widths.len()).collect();
+        indices.sort_by_key(|&i| column_widths[i]);
+
+        let mut new_widths: Vec<usize> = vec![0; column_widths.len()];
+        let mut remaining_budget = target_content_width;
+        let mut remaining_cols = column_widths.len();
+
+        for &i in &indices {
+            let fair_share = match remaining_cols > 0 {
+                true => remaining_budget / remaining_cols,
+                false => 0,
+            };
+            if column_widths[i] <= fair_share {
+                // This column fits within its share; keep natural width
+                new_widths[i] = column_widths[i];
+            } else {
+                // This column (and all wider ones) must share the remaining budget
+                new_widths[i] = fair_share.max(1);
+            }
+            remaining_budget = remaining_budget.saturating_sub(new_widths[i]);
+            remaining_cols -= 1;
+        }
+
+        // Distribute any leftover due to integer division
+        let assigned: usize = new_widths.iter().sum();
+        if assigned < target_content_width {
+            let mut remainder = target_content_width - assigned;
+            // Give extra to widest columns first
+            indices.sort_by(|&a, &b| column_widths[b].cmp(&column_widths[a]));
+            for &i in &indices {
+                if remainder == 0 {
+                    break;
+                }
+                new_widths[i] += 1;
+                remainder -= 1;
+            }
+        }
+
+        column_widths = new_widths;
+    }
+
+    // Re-wrap cell contents to fit capped column widths and recalculate row heights
+    for (row_idx, row) in rows.iter_mut().enumerate() {
+        let mut max_lines_in_row: usize = 1;
+
+        for (col_idx, cell) in row.iter_mut().enumerate() {
+            let col_width = column_widths[col_idx];
+            let mut new_lines: Vec<String> = Vec::new();
+
+            for line in cell.iter() {
+                if string_len(line) > col_width {
+                    let wrapped =
+                        wrap_highlighted_line(line.clone(), col_width, col_width, "", false);
+                    new_lines.extend(wrapped.split('\n').map(|s| s.to_string()));
+                } else {
+                    new_lines.push(line.clone());
+                }
+            }
+
+            max_lines_in_row = max_lines_in_row.max(new_lines.len());
+            *cell = new_lines;
+        }
+
+        row_heights[row_idx] = max_lines_in_row;
     }
 
     let color = &ctx.theme.border.fg;
@@ -547,10 +745,10 @@ fn render_table<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     }
 
     let sps = node.data.borrow().sourcepos;
-    let result = if ctx.center {
+    if ctx.center {
         let le = string_len(result.lines().nth(1).unwrap_or_default());
         let offset = sps.start.column.saturating_sub(1);
-        let offset = (ctx.term_width - offset)
+        let offset = (ctx.wininfo.sc_width as usize - offset)
             .saturating_sub(le)
             .saturating_div(2);
 
@@ -566,23 +764,30 @@ fn render_table<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
             .join("\n")
     } else {
         result
-    };
-
-    result
+    }
 }
 
 fn render_strong<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
-    let content = collect(node, ctx, "");
+    let content = collect(node, ctx, "").replace(RESET, &format!("{RESET}{BOLD}"));
     format!("{BOLD}{content}{NORMAL}")
 }
 
 fn render_emph<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
-    let content = collect(node, ctx, "");
+    let content = collect(node, ctx, "").replace(RESET, &format!("{RESET}{ITALIC}"));
     format!("{ITALIC}{content}{ITALIC_OFF}")
 }
 
-fn render_strikethrough<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+fn render_highlight<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let content = collect(node, ctx, "");
+    let color = &ctx.theme.yellow.bg;
+    let fg = &ctx.theme.black.fg;
+    let start = format!("{fg}{color}");
+    let content = content.replace(RESET, &format!("{RESET}{start}"));
+    format!("{start}{content}{RESET}")
+}
+
+fn render_strikethrough<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    let content = collect(node, ctx, "").replace(RESET, &format!("{RESET}{STRIKETHROUGH}"));
     format!("{STRIKETHROUGH}{content}{STRIKETHROUGH_OFF}")
 }
 
@@ -593,7 +798,9 @@ fn render_link<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let url = &node_link.url;
 
     let content = collect(node, ctx, "");
-    let cyan = ctx.theme.cyan.fg.clone();
+    let cyan = &ctx.theme.cyan.fg;
+    let start = format!("{UNDERLINE}{cyan}");
+    let content = content.replace(RESET, &format!("{RESET}{start}"));
     let osc8_start = format!("\x1b]8;;{}\x1b\\", url);
     let osc8_end = "\x1b]8;;\x1b\\";
     content
@@ -601,9 +808,9 @@ fn render_link<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
         .enumerate()
         .map(|(i, line)| {
             if i == 0 {
-                format!("{osc8_start}{UNDERLINE}{cyan}\u{f0339} {line}{RESET}{osc8_end}")
+                format!("{osc8_start}{start}\u{f0339} {line}{RESET}{osc8_end}")
             } else {
-                format!("  {osc8_start}{UNDERLINE}{cyan}{line}{RESET}{osc8_end}")
+                format!("\u{00A0}\u{00A0}{osc8_start}{start}{line}{RESET}{osc8_end}")
             }
         })
         .join("\n")
@@ -615,21 +822,32 @@ fn render_image<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     };
     let url = &node_link.url;
 
-    if let Some(img) = ctx.image_preprocessor.mapper.get(url) {
-        if img.is_ok {
-            return img.placeholder.clone();
-        }
+    if let Some(img) = ctx.image_preprocessor.mapper.get(url)
+        && img.is_ok
+    {
+        return img.placeholder.clone();
     }
 
     let content = collect(node, ctx, "");
-    let cyan = ctx.theme.cyan.fg.clone();
-    format!("{UNDERLINE}{cyan}\u{f0976} {}{RESET}", content)
+    let cyan = &ctx.theme.cyan.fg;
+    let start = format!("{UNDERLINE}{cyan}");
+    let content = content.replace(RESET, &format!("{RESET}{start}"));
+    format!("{start}\u{f0976} {}{RESET}", content)
 }
 
 fn render_code<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let NodeValue::Code(NodeCode { ref literal, .. }) = node.data.borrow().value else {
         panic!()
     };
+
+    // special formatting, we'll treat code blocks wrapped [] to be kbd.
+    if literal.starts_with('[') && literal.ends_with(']') {
+        let inner = &literal[1..literal.len() - 1];
+        let fg = &ctx.theme.foreground.fg;
+        let bg = &ctx.theme.surface.bg;
+        let cap_fg = &ctx.theme.surface.fg;
+        return format!("{cap_fg}\u{e0b6}{fg}{bg}{inner}{RESET}{cap_fg}\u{e0b4}{RESET}");
+    }
 
     let fg = &ctx.theme.green.fg;
     format!("{fg}{}{RESET}", literal)
@@ -639,14 +857,38 @@ fn render_html_inline<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> Strin
     let NodeValue::HtmlInline(ref literal) = node.data.borrow().value else {
         panic!()
     };
-
     let string_color = ctx.theme.string.fg.clone();
-    format!("{string_color}{literal}{RESET}")
+
+    if literal.starts_with("<span") {
+        if let Some(color) = extract_span_color(literal, ctx) {
+            return color.into_owned();
+        }
+        return String::new();
+    }
+
+    match literal.to_lowercase().as_str() {
+        "<u>" | "<ins>" => UNDERLINE.to_owned(),
+        "</u>" | "</ins>" => UNDERLINE_OFF.to_owned(),
+
+        "<br>" | "<br/>" | "<br />" => "\n".to_owned(),
+        "</span>" => RESET.to_owned(),
+
+        _ => format!("{string_color}{literal}{RESET}"),
+    }
 }
 
 fn render_superscript<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
-    // no real thing I can do
-    collect(node, ctx, "")
+    let content = collect(node, ctx, "");
+    let trimmed = content.trim();
+
+    let mut result = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        match to_superscript(ch) {
+            Some(sup) => result.push(sup),
+            None => return format!("^({})", trimmed),
+        }
+    }
+    result
 }
 
 fn render_multiline_block_quote<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
@@ -655,11 +897,9 @@ fn render_multiline_block_quote<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext
     };
     let fenced_offset = multiline_block_quote.fence_offset;
     ctx.blockquote_fenced_offset = Some(fenced_offset);
-    ctx.is_multi_block_quote = true;
 
     let res = render_block_quote(node, ctx);
     ctx.blockquote_fenced_offset = None;
-    ctx.is_multi_block_quote = false;
 
     res
 }
@@ -671,55 +911,183 @@ fn render_wiki_link<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String 
 
     let content = collect(node, ctx, "");
     let cyan = &ctx.theme.cyan.fg;
+    let content = content.replace(RESET, &format!("{RESET}{cyan}"));
     format!("{cyan}\u{f15d6} {}{RESET}", content)
 }
 
 fn render_spoilered_text<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let content = collect(node, ctx, "");
     let comment = &ctx.theme.comment.fg;
-    format!("{FAINT}{comment}{content}{RESET}")
+    let start = format!("{FAINT}{comment}");
+    let content = content.replace(RESET, &format!("{RESET}{start}"));
+    format!("{start}{content}{RESET}")
+}
+
+fn render_alert_like<'a>(
+    node: &'a AstNode<'a>,
+    ctx: &mut AnsiContext,
+    prefix: &str,
+    color: &str,
+) -> String {
+    let offset = 4 + ctx.indent() as u16 * 2;
+
+    ctx.force_simple_code_block += 1;
+    ctx.wininfo.sc_width -= offset;
+    let content = collect(node, ctx, "\n");
+    ctx.wininfo.sc_width += offset;
+    ctx.force_simple_code_block -= 1;
+
+    let mut result = format!("{color}▌ {BOLD}{prefix}{RESET}");
+    result.push('\n');
+    let body = content
+        .lines()
+        .map(|line| format!("{color}▌{RESET} {line}"))
+        .join("\n");
+    result.push_str(&body);
+
+    let indent = ctx.indent();
+    if ctx.should_wrap() {
+        wrap_char_based(ctx, &result, '▌', indent, "", "")
+    } else {
+        result
+    }
 }
 
 fn render_alert<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
     let NodeValue::Alert(ref node_alert) = node.data.borrow().value else {
         panic!()
     };
-    let alert_type = &node_alert.alert_type;
 
-    let kind = alert_type;
-    let blue = ctx.theme.blue.fg.clone();
-    let red = ctx.theme.red.fg.clone();
-    let green = ctx.theme.green.fg.clone();
-    let cyan = ctx.theme.cyan.fg.clone();
-    let yellow = ctx.theme.yellow.fg.clone();
-
-    let (prefix, color) = match kind {
-        comrak::nodes::AlertType::Note => ("\u{f05d6} NOTE", blue),
-        comrak::nodes::AlertType::Tip => ("\u{f400} TIP", green),
-        comrak::nodes::AlertType::Important => ("\u{f017e} INFO", cyan),
-        comrak::nodes::AlertType::Warning => ("\u{ea6c} WARNING", yellow),
-        comrak::nodes::AlertType::Caution => ("\u{f0ce6} DANGER", red),
+    let (prefix, color) = match node_alert.alert_type {
+        comrak::nodes::AlertType::Note => ("\u{f05d6} NOTE", ctx.theme.blue.fg.clone()),
+        comrak::nodes::AlertType::Tip => ("\u{f400} TIP", ctx.theme.green.fg.clone()),
+        comrak::nodes::AlertType::Important => ("\u{f017e} INFO", ctx.theme.cyan.fg.clone()),
+        comrak::nodes::AlertType::Warning => ("\u{ea6c} WARNING", ctx.theme.yellow.fg.clone()),
+        comrak::nodes::AlertType::Caution => ("\u{f0ce6} DANGER", ctx.theme.red.fg.clone()),
     };
 
-    let mut result = format!("{}▌ {BOLD}{}{RESET}", color, prefix);
+    render_alert_like(node, ctx, prefix, &color)
+}
 
-    ctx.force_simple_code_block += 1;
-    let alert_content = collect(node, ctx, "\n");
-    ctx.force_simple_code_block -= 1;
-
-    result.push('\n');
-    let alert_content = alert_content
-        .lines()
-        .map(|line| format!("{color}▌{RESET} {line}"))
-        .join("\n");
-    result.push_str(&alert_content);
-
-    let indent = ctx.indent();
-    let content = if ctx.should_wrap() {
-        wrap_char_based(&result, '▌', indent, "", "")
-    } else {
-        result
+fn render_block_directive<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    let NodeValue::BlockDirective(ref bd) = node.data.borrow().value else {
+        panic!()
     };
 
-    content
+    let raw = bd.info.trim();
+    let inner = raw
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(raw)
+        .trim();
+    let name = inner
+        .split(|c: char| c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('.')
+        .to_lowercase();
+
+    let (prefix, color) = match name.as_str() {
+        "callout-note" | "note" => ("\u{f05d6} NOTE", ctx.theme.blue.fg.clone()),
+        "callout-tip" | "tip" => ("\u{f400} TIP", ctx.theme.green.fg.clone()),
+        "callout-important" | "important" => ("\u{f017e} INFO", ctx.theme.cyan.fg.clone()),
+        "callout-warning" | "warning" => ("\u{ea6c} WARNING", ctx.theme.yellow.fg.clone()),
+        "callout-caution" | "caution" => ("\u{f0ce6} DANGER", ctx.theme.red.fg.clone()),
+        other => (
+            &*format!(
+                "\u{f0238} {}",
+                if other.is_empty() { "DIRECTIVE" } else { other }
+            ),
+            ctx.theme.comment.fg.clone(),
+        ),
+    };
+
+    render_alert_like(node, ctx, prefix, &color)
+}
+
+pub fn build_toc<'a>(root: &'a AstNode<'a>, ctx: &mut AnsiContext) -> String {
+    let mut headings: Vec<(u8, String)> = Vec::new();
+    collect_headings(root, ctx, &mut headings);
+
+    if headings.is_empty() {
+        return String::new();
+    }
+
+    let min_level = headings.iter().map(|(l, _)| *l).min().unwrap_or(1);
+    let entries: Vec<(usize, String)> = headings
+        .into_iter()
+        .map(|(l, t)| ((l - min_level) as usize, t))
+        .collect();
+
+    let bg = &ctx.theme.keyword_bg.bg;
+    let main = &ctx.theme.keyword.fg;
+    let title = " 󰠶 Table of Contents";
+    let title_len = string_len(title);
+    let padding = (ctx.wininfo.sc_width as usize).saturating_sub(title_len);
+    let title_line = format!("{main}{bg}{title}{}{RESET}", " ".repeat(padding));
+
+    let tree_color = &ctx.theme.guide.fg;
+    let fg = &ctx.theme.foreground.fg;
+
+    let mut out = String::new();
+    out.push_str(&title_line);
+    out.push('\n');
+    out.push('\n');
+
+    for i in 0..entries.len() {
+        let (depth, ref text) = entries[i];
+
+        if depth == 0 {
+            let prev_had_children = i > 0 && entries[i - 1].0 > 0;
+            if prev_had_children {
+                out.push('\n');
+            }
+            out.push_str(&format!("{BOLD}{fg}{text}{RESET}\n"));
+            continue;
+        }
+
+        let mut prefix = String::new();
+        for col in 1..depth {
+            let has_later_sibling = entries[i + 1..]
+                .iter()
+                .take_while(|(d, _)| *d >= col)
+                .any(|(d, _)| *d == col);
+            if has_later_sibling {
+                prefix.push_str(&format!("{tree_color}│ {RESET}"));
+            } else {
+                prefix.push_str("  ");
+            }
+        }
+
+        let has_sibling_at_depth = entries[i + 1..]
+            .iter()
+            .take_while(|(d, _)| *d >= depth)
+            .any(|(d, _)| *d == depth);
+        let connector = if has_sibling_at_depth {
+            "├─"
+        } else {
+            "└─"
+        };
+
+        out.push_str(&format!(
+            "{prefix}{tree_color}{connector}{RESET} {fg}{text}{RESET}\n"
+        ));
+    }
+
+    out.trim_end().to_owned()
+}
+
+fn collect_headings<'a>(node: &'a AstNode<'a>, ctx: &mut AnsiContext, out: &mut Vec<(u8, String)>) {
+    if let NodeValue::Heading(NodeHeading { level, .. }) = node.data.borrow().value {
+        let text = collect(node, ctx, "");
+        let text = trim_ansi_string(strip_str(&text).to_string());
+        if !text.is_empty() {
+            out.push((level, text));
+        }
+        return;
+    }
+
+    for child in node.children() {
+        collect_headings(child, ctx, out);
+    }
 }

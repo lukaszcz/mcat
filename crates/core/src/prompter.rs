@@ -1,13 +1,229 @@
+use anyhow::Result;
 use ignore::WalkBuilder;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::MultiSelect;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::runtime::{Builder, Runtime};
 
 use crate::markdown_viewer::utils::get_lang_icon_and_color;
 
-pub fn prompt_for_files(dir: &Path, hidden: bool) -> Result<Vec<PathBuf>, String> {
+pub static RUNTIME: LazyLock<Runtime> =
+    LazyLock::new(|| Builder::new_current_thread().enable_all().build().unwrap());
+
+#[derive(Clone)]
+pub enum MultiBar {
+    Indicatif(MultiProgress),
+    Ghostty(Arc<GhosttyBar>),
+}
+
+pub enum BarHandle {
+    Indicatif(ProgressBar),
+    Ghostty(GhosttyBarHandle),
+}
+
+impl MultiBar {
+    pub fn indicatif() -> Self {
+        Self::Indicatif(MultiProgress::new())
+    }
+
+    pub fn ghostty() -> Self {
+        Self::Ghostty(GhosttyBar::new())
+    }
+
+    pub fn add(&self, total: Option<u64>, msg: Option<&str>) -> BarHandle {
+        match self {
+            Self::Indicatif(multi) => {
+                let pb = match total {
+                    Some(n) => {
+                        let pb = multi.add(ProgressBar::new(n));
+                        pb.set_style(
+                            ProgressStyle::default_bar()
+                                .template("{spinner:.green} [{bar:50.blue/white}] {bytes}/{total_bytes} ({percent}%)")
+                                .unwrap()
+                                .progress_chars("█▓▒░"),
+                        );
+                        pb
+                    }
+                    None => {
+                        let pb = multi.add(ProgressBar::new_spinner());
+                        pb.set_style(
+                            ProgressStyle::default_spinner()
+                                .template(&format!("{{spinner:.green}} {}", msg.unwrap_or("{msg}")))
+                                .unwrap()
+                                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+                        );
+                        pb
+                    }
+                };
+                BarHandle::Indicatif(pb)
+            }
+            Self::Ghostty(ghostty) => BarHandle::Ghostty(ghostty.add(total)),
+        }
+    }
+}
+
+impl BarHandle {
+    pub fn set_position(&self, pos: u64) {
+        match self {
+            Self::Indicatif(pb) => pb.set_position(pos),
+            Self::Ghostty(h) => h.set_position(pos),
+        }
+    }
+
+    pub fn enable_steady_tick(&self, duration: std::time::Duration) {
+        match self {
+            Self::Indicatif(pb) => pb.enable_steady_tick(duration),
+            Self::Ghostty(_) => {} // not sure if we should support it for now.
+        }
+    }
+
+    pub fn finish(&self) {
+        match self {
+            Self::Indicatif(pb) => pb.finish_and_clear(),
+            Self::Ghostty(h) => h.finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GhosttyBar {
+    bars: boxcar::Vec<(Arc<AtomicU64>, Option<u64>, Arc<AtomicBool>)>, // (current, total, done)
+}
+
+pub struct GhosttyBarHandle {
+    current: Arc<AtomicU64>,
+    manager: Weak<GhosttyBar>,
+}
+
+impl Drop for GhosttyBarHandle {
+    fn drop(&mut self) {
+        if let Some(mgr) = self.manager.upgrade() {
+            mgr.finish(&self.current);
+        }
+    }
+}
+
+impl GhosttyBarHandle {
+    pub fn set_position(&self, pos: u64) {
+        self.current.store(pos, Ordering::Release);
+        if let Some(mgr) = self.manager.upgrade() {
+            mgr.print();
+        }
+    }
+
+    pub fn finish(&self) {
+        if let Some(mgr) = self.manager.upgrade() {
+            mgr.finish(&self.current);
+        }
+    }
+}
+
+impl GhosttyBar {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bars: boxcar::Vec::new(),
+        })
+    }
+
+    fn setup_sigint_handler() {
+        #[cfg(not(windows))]
+        {
+            use signal_hook::iterator::Signals;
+            if let Ok(mut signals) = Signals::new([signal_hook::consts::SIGINT]) {
+                std::thread::spawn(move || {
+                    if signals.forever().next().is_some() {
+                        eprint!("\x1b]9;4;0\x07");
+                        std::process::exit(0);
+                    }
+                });
+            }
+        }
+        // ghostty doesn't really support windows, so this is just a stub..
+        #[cfg(windows)]
+        {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let flag = Arc::new(AtomicBool::new(false));
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&flag)).unwrap();
+            std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                eprint!("\x1b]9;4;0\x07");
+                std::process::exit(0);
+            });
+        }
+    }
+
+    pub fn add(self: &Arc<Self>, total: Option<u64>) -> GhosttyBarHandle {
+        if self.bars.count() == 0 {
+            GhosttyBar::setup_sigint_handler();
+        }
+
+        let current = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        self.bars
+            .push((Arc::clone(&current), total, Arc::clone(&done)));
+        GhosttyBarHandle {
+            current,
+            manager: Arc::downgrade(self),
+        }
+    }
+
+    pub fn print(&self) {
+        let mut total_pct = 0.0f64;
+        let mut count = 0usize;
+
+        for (_, (current, total, done)) in &self.bars {
+            if done.load(Ordering::Acquire) {
+                continue;
+            }
+            let cur = current.load(Ordering::Acquire);
+            if let Some(total) = total {
+                let pct = (cur as f64 / *total as f64 * 100.0).min(100.0);
+                total_pct += pct;
+                count += 1;
+            }
+        }
+
+        let all_done = self.bars.count() > 0
+            && self
+                .bars
+                .iter()
+                .all(|(_, (_, _, done))| done.load(Ordering::Acquire));
+
+        if all_done {
+            eprint!("\x1b]9;4;0\x07");
+        } else if count == 0 {
+            eprint!("\x1b]9;4;3\x07");
+        } else {
+            let avg = (total_pct / count as f64) as u32;
+            eprint!("\x1b]9;4;1;{avg}\x07");
+        }
+    }
+
+    fn finish(&self, current: &Arc<AtomicU64>) {
+        if let Some((_, (_, _, done))) = self
+            .bars
+            .iter()
+            .find(|(_, (c, _, _))| Arc::ptr_eq(c, current))
+        {
+            done.store(true, Ordering::Release);
+        }
+        self.print();
+    }
+}
+
+pub fn prompt_for_files(dir: &Path, hidden: bool) -> Result<Vec<PathBuf>> {
     let mut all_paths = collect_gitignored_paths(dir, hidden)?;
-    all_paths.sort(); // Ensures folders come before contents
+    all_paths.sort();
 
     let tree_view = format_file_list(&all_paths, dir);
 
@@ -20,20 +236,19 @@ pub fn prompt_for_files(dir: &Path, hidden: bool) -> Result<Vec<PathBuf>, String
     let selected = MultiSelect::new("Select files or folders", tree_view)
         .with_page_size(20)
         .with_vim_mode(true)
-        .prompt()
-        .map_err(|e| e.to_string())?;
+        .prompt()?;
 
     let selected_paths: HashSet<PathBuf> = selected
         .into_iter()
         .filter_map(|label| index_map.get(&label).cloned())
         .collect();
 
-    // Avoid duplicates: if a folder is selected, skip its inner files
+    // if a folder is selected, skip its inner files
     let mut final_files = HashSet::new();
 
     for path in &selected_paths {
         if path.is_file() {
-            // Only include files not covered by a selected folder
+            // only include files not covered by a selected folder
             let covered = selected_paths
                 .iter()
                 .any(|other| other.is_dir() && path.starts_with(other));
@@ -53,7 +268,7 @@ pub fn prompt_for_files(dir: &Path, hidden: bool) -> Result<Vec<PathBuf>, String
     Ok(final_files.into_iter().collect())
 }
 
-fn collect_gitignored_paths(dir: &Path, hidden: bool) -> Result<Vec<PathBuf>, String> {
+fn collect_gitignored_paths(dir: &Path, hidden: bool) -> Result<Vec<PathBuf>> {
     let walker = WalkBuilder::new(dir)
         .standard_filters(!hidden)
         .hidden(!hidden)
@@ -85,7 +300,7 @@ fn format_file_list(paths: &[PathBuf], base: &Path) -> Vec<String> {
     let blue = "\x1b[34m";
     let purple = "\x1b[35m";
     let dir_color = &format!("{bold}{blue}");
-    let link_color = &format!("{purple}");
+    let link_color = purple;
 
     for (i, path) in paths.iter().enumerate() {
         let rel = path.strip_prefix(base).unwrap_or(path);
@@ -110,7 +325,7 @@ fn format_file_list(paths: &[PathBuf], base: &Path) -> Vec<String> {
                 })
                 .unwrap_or(true);
             line.push_str(if is_last { "└── " } else { "├── " });
-            line.push_str(&reset);
+            line.push_str(reset);
         }
 
         let name_color = if is_link {
@@ -122,15 +337,13 @@ fn format_file_list(paths: &[PathBuf], base: &Path) -> Vec<String> {
         };
         if is_dir {
             line.push_str(&format!("{name_color}\u{f024b} {name}/{reset}"));
+        } else if let Some((icon, color)) = get_lang_icon_and_color(&ext) {
+            line.push_str(&format!("{color}{icon}{reset} {name_color}{name}{reset}"));
         } else {
-            if let Some((icon, color)) = get_lang_icon_and_color(&ext) {
-                line.push_str(&format!("{color}{icon}{reset} {name_color}{name}{reset}"));
-            } else {
-                line.push_str(&format!("{name_color}{name}{reset}"));
-            }
+            line.push_str(&format!("{name_color}{name}{reset}"));
         }
 
-        // Add invisible unique suffix to make each label distinct
+        // add invisible unique suffix to make each label distinct
         line.push_str(&encode_invisible_id(i));
 
         formatted.push(line);

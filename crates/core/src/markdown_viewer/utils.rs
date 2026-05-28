@@ -1,7 +1,6 @@
-use std::{collections::HashMap, sync::OnceLock, usize};
+use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
 
 use itertools::Itertools;
-use rasteroid::term_misc;
 use regex::Regex;
 use strip_ansi_escapes::strip_str;
 use syntect::{
@@ -13,7 +12,11 @@ use unicode_width::UnicodeWidthStr;
 
 use super::render::{AnsiContext, BOLD, RESET};
 
-static ANSI_ESCAPE_REGEX: OnceLock<Regex> = OnceLock::new();
+static ANSI_ESCAPE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
+
+static COLOR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)color\s*:\s*([a-z]+|#[0-9a-f]{3,8})"#).unwrap());
 
 pub fn get_lang_icon_and_color(lang: &str) -> Option<(&'static str, &'static str)> {
     let map: HashMap<&str, (&str, &str)> = [
@@ -151,48 +154,63 @@ pub fn get_lang_icon_and_color(lang: &str) -> Option<(&'static str, &'static str
 }
 
 pub fn trim_ansi_string(mut str: String) -> String {
-    let stripped = strip_str(&str);
-    let mut leading = stripped.chars().take_while(|c| c.is_whitespace()).count();
-    let mut trailing = stripped
+    // strip str for some reason strips tabs too..
+    let stripped = if str.contains('\t') {
+        strip_str(str.replace('\t', " "))
+    } else {
+        strip_str(&str)
+    };
+
+    let mut leading = stripped
+        .chars()
+        .take_while(|c| c.is_ascii_whitespace())
+        .count();
+    let trailing = stripped
         .chars()
         .rev()
-        .take_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_whitespace())
         .count();
 
     if leading == 0 && trailing == 0 {
         return str;
     }
 
-    // Remove first N spaces
-    str.retain(|c| {
-        if c == ' ' && leading > 0 {
-            leading -= 1;
-            false
-        } else {
-            true
-        }
-    });
-
-    // Remove last N spaces
-    let mut i = str.len();
-    while i > 0 && trailing > 0 {
-        i -= 1;
-        if str.as_bytes()[i] == b' ' {
-            str.remove(i);
-            trailing -= 1;
+    // find where trailing begins
+    let mut trailing_start = str.len();
+    let mut found = 0;
+    let bytes = str.as_bytes();
+    while found < trailing && trailing_start > 0 {
+        trailing_start -= 1;
+        if bytes[trailing_start].is_ascii_whitespace() {
+            found += 1;
         }
     }
+
+    // strip both ends
+    let mut idx = 0;
+    str.retain(|c| {
+        let i = idx;
+        idx += c.len_utf8();
+        if c.is_ascii_whitespace() {
+            if leading > 0 {
+                leading -= 1;
+                return false;
+            }
+            if i >= trailing_start {
+                return false;
+            }
+        }
+        true
+    });
 
     str
 }
 
 pub fn string_len(str: &str) -> usize {
-    strip_ansi_escapes::strip_str(&str).width()
+    strip_ansi_escapes::strip_str(str).width()
 }
 
 fn find_last_format(text: &str) -> Option<String> {
-    let re = ANSI_ESCAPE_REGEX.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
-
     let mut fg: Option<String> = None;
     let mut bold = false;
     let mut faint = false;
@@ -201,7 +219,7 @@ fn find_last_format(text: &str) -> Option<String> {
     let mut strikethrough = false;
     let mut ever_set = false;
 
-    for m in re.find_iter(text) {
+    for m in ANSI_ESCAPE_REGEX.find_iter(text) {
         let seq = m.as_str();
         let codes_str = &seq[2..seq.len() - 1];
         ever_set = true;
@@ -279,13 +297,14 @@ fn find_last_format(text: &str) -> Option<String> {
 }
 
 pub fn wrap_char_based(
+    ctx: &AnsiContext,
     original: &str,
     char: char,
     indent: usize,
     prefix: &str,
     sub_prefix: &str,
 ) -> String {
-    let (space, sub_space, indent, sub_indent) = info_for_wrapping(indent, prefix, sub_prefix);
+    let (space, sub_space, indent, sub_indent) = info_for_wrapping(ctx, indent, prefix, sub_prefix);
     let suffix = if original.ends_with("\n") { "\n" } else { "" };
 
     original
@@ -294,7 +313,8 @@ pub fn wrap_char_based(
             let char_index = line.rfind(char).map(|v| v + char.len_utf8()).unwrap_or(0);
             let str_to_char = line.get(..char_index).unwrap_or("");
             let line = format!("{indent}{line}");
-            let sub_prefix = format!("{sub_indent}{str_to_char} ");
+            // adding RESET, since it is only used for block quote and alerts
+            let sub_prefix = format!("{sub_indent}{str_to_char}{RESET} ");
             let sub_space = sub_space.saturating_sub(string_len(&sub_prefix));
             wrap_highlighted_line(line, space, sub_space, &sub_prefix, false)
                 .trim_matches('\n')
@@ -305,11 +325,12 @@ pub fn wrap_char_based(
 }
 
 fn info_for_wrapping(
+    ctx: &AnsiContext,
     indent: usize,
     prefix: &str,
     sub_prefix: &str,
 ) -> (usize, usize, String, String) {
-    let space = (term_misc::get_wininfo().sc_width as usize).saturating_sub(indent * 2);
+    let space = (ctx.wininfo.sc_width as usize).saturating_sub(indent * 2);
     let sub_space = space.saturating_sub(string_len(sub_prefix));
     let space = space.saturating_sub(string_len(prefix));
 
@@ -322,13 +343,15 @@ fn info_for_wrapping(
 
 /// for braindead indenting any element.
 pub fn wrap_lines(
+    ctx: &AnsiContext,
     original: &str,
     multi_line: bool,
     indent: usize,
     prefix: &str,
     sub_prefix: &str,
+    auto_indent: bool,
 ) -> String {
-    let (space, sub_space, indent, sub_indent) = info_for_wrapping(indent, prefix, sub_prefix);
+    let (space, sub_space, indent, sub_indent) = info_for_wrapping(ctx, indent, prefix, sub_prefix);
     let suffix = if original.ends_with("\n") { "\n" } else { "" };
 
     if multi_line {
@@ -336,7 +359,7 @@ pub fn wrap_lines(
             .lines()
             .map(|line| {
                 let line = format!("{indent}{line}");
-                wrap_highlighted_line(line, space, sub_space, &sub_indent, false)
+                wrap_highlighted_line(line, space, sub_space, &sub_indent, auto_indent)
                     .trim_matches('\n')
                     .to_owned()
             })
@@ -344,7 +367,7 @@ pub fn wrap_lines(
             + suffix
     } else {
         let line = format!("{indent}{original}");
-        wrap_highlighted_line(line, space, sub_space, &indent, false)
+        wrap_highlighted_line(line, space, sub_space, &indent, auto_indent)
     }
 }
 
@@ -360,7 +383,6 @@ fn wrap_with_sub(original: String, first_width: usize, sub_width: usize) -> Vec<
     };
     let sub_lines = lines.into_iter().skip(1).join(" ");
 
-    let sub_width = sub_width;
     let lines: Vec<String> = textwrap::wrap(&sub_lines, sub_width)
         .into_iter()
         .map(|cow| cow.into_owned())
@@ -414,9 +436,8 @@ pub fn wrap_highlighted_line(
             buf.push_str("\x1b]8;;\x1b\\");
         }
         // carry on formatting
-        match find_last_format(line) {
-            Some(ansi) => pre_format = ansi,
-            None => {}
+        if let Some(ansi) = find_last_format(&buf) {
+            pre_format = ansi
         }
         buf.push_str(RESET);
     }
@@ -425,7 +446,7 @@ pub fn wrap_highlighted_line(
     buf
 }
 
-pub fn format_code_simple<'a>(code: &str, lang: &str, ctx: &AnsiContext, indent: usize) -> String {
+pub fn format_code_simple(code: &str, lang: &str, ctx: &AnsiContext, indent: usize) -> String {
     let header = match get_lang_icon_and_color(lang) {
         Some((icon, color)) => &format!("{color}{icon} {lang}{RESET}",),
         None => lang,
@@ -434,7 +455,8 @@ pub fn format_code_simple<'a>(code: &str, lang: &str, ctx: &AnsiContext, indent:
     let ts = ctx.theme.to_syntect_theme();
     let syntax = ctx
         .ps
-        .find_syntax_by_token(lang)
+        .find_syntax_by_extension(lang)
+        .or_else(|| ctx.ps.find_syntax_by_token(lang))
         .unwrap_or_else(|| ctx.ps.find_syntax_plain_text());
     let mut highlighter = HighlightLines::new(syntax, &ts);
 
@@ -453,7 +475,7 @@ pub fn format_code_simple<'a>(code: &str, lang: &str, ctx: &AnsiContext, indent:
 
     let sub_indent = 4usize;
     let sub_indent = " ".repeat(sub_indent.saturating_sub(indent));
-    let (space, sub_space, indent, sub_indent) = info_for_wrapping(indent, "", &sub_indent);
+    let (space, sub_space, indent, sub_indent) = info_for_wrapping(ctx, indent, "", &sub_indent);
     let content = content
         .lines()
         .map(|line| {
@@ -467,11 +489,12 @@ pub fn format_code_simple<'a>(code: &str, lang: &str, ctx: &AnsiContext, indent:
     format!("{indent}{header}\n{content}{RESET}")
 }
 
-pub fn format_code_full<'a>(code: &str, lang: &str, ctx: &AnsiContext) -> String {
+pub fn format_code_full(code: &str, lang: &str, ctx: &AnsiContext) -> String {
     let ts = ctx.theme.to_syntect_theme();
     let syntax = ctx
         .ps
-        .find_syntax_by_token(lang)
+        .find_syntax_by_extension(lang)
+        .or_else(|| ctx.ps.find_syntax_by_token(lang))
         .unwrap_or_else(|| ctx.ps.find_syntax_plain_text());
     let mut highlighter = HighlightLines::new(syntax, &ts);
 
@@ -483,7 +506,7 @@ pub fn format_code_full<'a>(code: &str, lang: &str, ctx: &AnsiContext) -> String
     let max_lines = code.lines().count();
     let num_width = max_lines.to_string().chars().count() + 2;
     // -1 because the indent is 1 based
-    let term_width = term_misc::get_wininfo().sc_width;
+    let term_width = ctx.wininfo.sc_width;
     let text_size = (term_width as usize)
         .saturating_sub(num_width)
         .saturating_sub(3); // -2 for spacing both ways, -1 for the | char after line num
@@ -506,10 +529,9 @@ pub fn format_code_full<'a>(code: &str, lang: &str, ctx: &AnsiContext) -> String
     );
     buffer.push_str(&format!("{top_header}\n{middle_header}\n{bottom_header}\n"));
 
-    let mut num = 1;
     let prefix = format!("{}{color}│{RESET}     ", " ".repeat(num_width));
     let sub_text_size = text_size.saturating_sub(4); // 4 extra space for visual indent.
-    for line in LinesWithEndings::from(code) {
+    for (num, line) in (1..).zip(LinesWithEndings::from(code)) {
         let left_space = num_width - num.to_string().chars().count();
         let left_offset = left_space / 2;
         let right_offset = left_space - left_offset;
@@ -523,7 +545,6 @@ pub fn format_code_full<'a>(code: &str, lang: &str, ctx: &AnsiContext) -> String
             " ".repeat(right_offset),
             highlighted
         ));
-        num += 1;
     }
 
     let last_border = format!(
@@ -532,18 +553,19 @@ pub fn format_code_full<'a>(code: &str, lang: &str, ctx: &AnsiContext) -> String
         "─".repeat(term_width as usize - num_width - 1)
     );
     buffer.push_str(&last_border);
-    format!("{buffer}")
+    buffer
 }
 
-pub fn format_code_box<'a>(code: &str, lang: &str, title: &str, ctx: &AnsiContext) -> String {
-    let term_width = ctx.term_width;
+pub fn format_code_box(code: &str, lang: &str, title: &str, ctx: &AnsiContext) -> String {
+    let term_width = ctx.wininfo.sc_width as usize;
     let color = &ctx.theme.border.fg;
     let content = code.trim();
 
     let ts = ctx.theme.to_syntect_theme();
     let syntax = ctx
         .ps
-        .find_syntax_by_token(lang)
+        .find_syntax_by_extension(lang)
+        .or_else(|| ctx.ps.find_syntax_by_token(lang))
         .unwrap_or_else(|| ctx.ps.find_syntax_plain_text());
     let mut highlighter = HighlightLines::new(syntax, &ts);
 
@@ -610,12 +632,352 @@ pub fn format_code_box<'a>(code: &str, lang: &str, title: &str, ctx: &AnsiContex
         "─".repeat(box_width.saturating_sub(2))
     ));
 
-    format!("{buffer}")
+    buffer
 }
 
 pub fn format_tb(ctx: &AnsiContext, offset: usize) -> String {
-    let w = term_misc::get_wininfo().sc_width as usize;
+    let w = ctx.wininfo.sc_width as usize;
     let br = "━".repeat(w.saturating_sub(offset.saturating_sub(1)));
     let border = &ctx.theme.guide.fg;
     format!("{border}{br}{RESET}")
+}
+
+#[rustfmt::skip]
+pub fn to_superscript(ch: char) -> Option<char> {
+    Some(match ch {
+        // nums
+        '0' => '⁰', '1' => '¹', '2' => '²', '3' => '³', '4' => '⁴',
+        '5' => '⁵', '6' => '⁶', '7' => '⁷', '8' => '⁸', '9' => '⁹',
+
+        // symbols
+        '+' => '⁺', '-' => '⁻', '=' => '⁼', '(' => '⁽', ')' => '⁾',
+
+        // lowercase letters (no q)
+        'a' => 'ᵃ', 'b' => 'ᵇ', 'c' => 'ᶜ', 'd' => 'ᵈ', 'e' => 'ᵉ',
+        'f' => 'ᶠ', 'g' => 'ᵍ', 'h' => 'ʰ', 'i' => 'ⁱ', 'j' => 'ʲ',
+        'k' => 'ᵏ', 'l' => 'ˡ', 'm' => 'ᵐ', 'n' => 'ⁿ', 'o' => 'ᵒ',
+        'p' => 'ᵖ', 'r' => 'ʳ', 's' => 'ˢ', 't' => 'ᵗ', 'u' => 'ᵘ',
+        'v' => 'ᵛ', 'w' => 'ʷ', 'x' => 'ˣ', 'y' => 'ʸ', 'z' => 'ᶻ',
+
+        // uppercase letters (no C, F, Q, S, X, Y, Z)
+        'A' => 'ᴬ', 'B' => 'ᴮ', 'D' => 'ᴰ', 'E' => 'ᴱ', 'G' => 'ᴳ',
+        'H' => 'ᴴ', 'I' => 'ᴵ', 'J' => 'ᴶ', 'K' => 'ᴷ', 'L' => 'ᴸ',
+        'M' => 'ᴹ', 'N' => 'ᴺ', 'O' => 'ᴼ', 'P' => 'ᴾ', 'R' => 'ᴿ',
+        'T' => 'ᵀ', 'U' => 'ᵁ', 'V' => 'ⱽ', 'W' => 'ᵂ',
+
+        ' ' => ' ',
+
+        _ => return None,
+    })
+}
+
+pub fn extract_span_color<'a>(lit: &str, ctx: &'a AnsiContext) -> Option<Cow<'a, str>> {
+    let caps = COLOR_RE.captures(lit)?;
+    let color = caps.get(1)?.as_str().to_lowercase();
+    let theme = &ctx.theme;
+
+    if let Some(hex) = color.strip_prefix('#') {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        return Some(Cow::Owned(format!("\x1b[38;2;{r};{g};{b}m")));
+    }
+
+    let name = match color.as_str() {
+        "red" => &theme.red.fg,
+        "green" => &theme.green.fg,
+        "blue" => &theme.blue.fg,
+        "yellow" => &theme.yellow.fg,
+        "magenta" | "purple" | "pink" => &theme.magenta.fg,
+        "cyan" => &theme.cyan.fg,
+        "black" => &theme.black.fg,
+        "white" | "gray" | "grey" => &theme.foreground.fg,
+        _ => return None,
+    };
+    Some(Cow::Borrowed(name))
+}
+
+pub fn prettify_latex(src: &str, ctx: &AnsiContext) -> String {
+    let cmd = &ctx.theme.keyword.fg;
+    let number = &ctx.theme.string.fg;
+    let op = &ctx.theme.yellow.fg;
+    let script = &ctx.theme.magenta.fg;
+    let brace = &ctx.theme.comment.fg;
+    let default = &ctx.theme.cyan.fg;
+
+    let mut out = String::with_capacity(src.len() * 2);
+    let mut chars = src.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push_str(cmd);
+                out.push(c);
+                if let Some(&next) = chars.peek() {
+                    if next.is_ascii_alphabetic() {
+                        while let Some(&ch) = chars.peek() {
+                            if ch.is_ascii_alphabetic() {
+                                out.push(ch);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    } else {
+                        out.push(next);
+                        chars.next();
+                    }
+                }
+                out.push_str(RESET);
+            }
+            '{' | '}' => {
+                out.push_str(brace);
+                out.push(c);
+                out.push_str(RESET);
+            }
+            '^' | '_' => {
+                out.push_str(script);
+                out.push(c);
+                out.push_str(RESET);
+            }
+            '0'..='9' => {
+                out.push_str(number);
+                out.push(c);
+                out.push_str(RESET);
+            }
+            '+' | '-' | '=' | '*' | '/' | '<' | '>' | '|' | '!' => {
+                out.push_str(op);
+                out.push(c);
+                out.push_str(RESET);
+            }
+            ' ' | '\t' | '\n' => out.push(c),
+            _ => {
+                out.push_str(default);
+                out.push(c);
+                out.push_str(RESET);
+            }
+        }
+    }
+
+    out
+}
+
+// we only test core wrapping logic..
+#[cfg(test)]
+mod tests {
+    use rasteroid::{RasterEncoder, term_misc::Wininfo};
+
+    use crate::{
+        config::McatConfig, markdown_viewer::image_preprocessor::ImagePreprocessor,
+        themes::CustomTheme,
+    };
+
+    use super::*;
+
+    fn make_ctx() -> AnsiContext {
+        let arena = comrak::Arena::new();
+        let root = comrak::parse_document(&arena, "", &comrak::Options::default());
+        let mut conf = McatConfig::default();
+        conf.encoder = Some(RasterEncoder::Kitty);
+        conf.wininfo = Some(Wininfo {
+            sc_width: 50,
+            sc_height: 20,
+            spx_width: 1920,
+            spx_height: 1080,
+            is_tmux: false,
+            needs_inline: true,
+        });
+        AnsiContext {
+            ps: two_face::syntax::extra_newlines(),
+            theme: CustomTheme::github(),
+            wininfo: conf.wininfo.clone().unwrap(),
+            hide_line_numbers: false,
+            show_frontmatter: false,
+            center: false,
+            image_preprocessor: ImagePreprocessor::new(root, &conf, None).unwrap(),
+            blockquote_fenced_offset: None,
+            collecting_depth: 0,
+            under_header: false,
+            force_simple_code_block: 0,
+            list_depth: 0,
+        }
+    }
+
+    #[test]
+    fn test_trim_ansi_string_trims() {
+        assert_eq!(trim_ansi_string("  hello  ".into()), "hello");
+        assert_eq!(trim_ansi_string("hello".into()), "hello");
+        assert_eq!(trim_ansi_string("   ".into()), "");
+        assert_eq!(
+            trim_ansi_string("\x1b[31m red text \x1b[0m".into()),
+            "\x1b[31mred text\x1b[0m"
+        );
+        // we use nbsp for logic, so it must not be stripped.
+        assert_eq!(
+            trim_ansi_string("\u{00A0}hello world".into()),
+            "\u{00A0}hello world"
+        );
+        // regression, strip_str strips tabs too, we fixed that with replace
+        assert_eq!(trim_ansi_string("\t\nhello\t\n".into()), "hello");
+        // from the above, make sure the replace stay 1 len
+        assert_eq!(trim_ansi_string("\thello world".into()), "hello world");
+    }
+
+    #[test]
+    fn test_string_len_ignores_ansi() {
+        assert_eq!(string_len("hello"), 5);
+        assert_eq!(string_len("\x1b[31mhello\x1b[0m"), 5);
+        assert_eq!(string_len(""), 0);
+    }
+
+    #[test]
+    fn test_find_last_format_tracks_state() {
+        assert_eq!(find_last_format("hello"), None);
+        assert_eq!(
+            find_last_format("\x1b[31mhello\x1b[0m"),
+            Some(String::new())
+        );
+        assert_eq!(find_last_format("\x1b[1mhello"), Some("\x1b[1m".into()));
+        assert_eq!(
+            find_last_format("\x1b[31mhi\x1b[32mbye"),
+            Some("\x1b[32m".into())
+        );
+        assert_eq!(
+            find_last_format("\x1b[1m\x1b[31mhi"),
+            Some("\x1b[1;31m".into())
+        );
+    }
+
+    #[test]
+    fn test_info_for_wrapping_basic() {
+        let ctx = make_ctx();
+        // sc_width=50, indent=2 -> space=50-(2*2)=46
+        let (space, sub_space, indent, sub_indent) = info_for_wrapping(&ctx, 2, "", "");
+        assert_eq!(space, 46);
+        assert_eq!(sub_space, 46);
+        assert_eq!(indent, "  ");
+        assert_eq!(sub_indent, "  ");
+
+        // prefix and sub_prefix affect space/sub_space
+        let (space, sub_space, indent, sub_indent) = info_for_wrapping(&ctx, 0, "> ", "  ");
+        assert_eq!(space, 48); // 50 - len("> ")
+        assert_eq!(sub_space, 48); // 50 - len("  ")
+        assert_eq!(indent, "> ");
+        assert_eq!(sub_indent, "  ");
+
+        let (space, sub_space, indent, sub_indent) = info_for_wrapping(&ctx, 2, "> ", "  ");
+        assert_eq!(space, 44); // 50 - (2*2) - len("> ")
+        assert_eq!(sub_space, 44); // 50 - (2*2) - len("  ")
+        assert_eq!(indent, "  > ");
+        assert_eq!(sub_indent, "    ");
+    }
+
+    #[test]
+    fn test_wrap_highlighted_line_basic() {
+        let text = "the quick brown fox jumps over the lazy dog";
+
+        // fits in width -> returned as-is
+        assert_eq!(
+            wrap_highlighted_line(text.to_string(), 50, 50, "", false),
+            text
+        );
+
+        // wraps at first_width, sub lines get sub_prefix
+        let result = wrap_highlighted_line(text.to_string(), 10, 30, ">> ", false);
+        for line in result.lines().skip(1) {
+            assert!(
+                line.starts_with(">> "),
+                "sub line should start with '>> ', got: {:?}",
+                line
+            );
+        }
+
+        // exact width -> no wrap
+        let ten = "0123456789".to_string();
+        assert_eq!(
+            wrap_highlighted_line(ten.clone(), 10, 10, ">> ", false),
+            ten
+        );
+
+        // trailing newline preserved
+        assert!(
+            wrap_highlighted_line(format!("{text}\n"), 10, 30, "", false).ends_with("\n"),
+            "trailing newline should be preserved"
+        );
+
+        // no trailing newline -> none added
+        assert!(
+            !wrap_highlighted_line(text.to_string(), 10, 30, "", false).ends_with("\n"),
+            "no trailing newline should not be added"
+        );
+
+        // auto_indent copies leading spaces from first line onto all sub lines
+        let result = wrap_highlighted_line(format!("    {text}"), 12, 40, "", true);
+        for line in result.lines().skip(1) {
+            assert!(
+                line.starts_with("    "),
+                "auto_indent sub line should start with 4 spaces, got: {:?}",
+                line
+            );
+        }
+
+        // ansi color from first line carries into sub lines
+        let result = wrap_highlighted_line(format!("\x1b[31m{text}\x1b[0m"), 10, 30, "  ", false);
+        for line in result.lines().skip(1) {
+            assert!(
+                line.starts_with("  \x1b[31m"),
+                "ansi color should carry into sub lines, got: {:?}",
+                line
+            );
+        }
+
+        // sub_prefix is empty -> sub lines start directly with text
+        let result = wrap_highlighted_line(text.to_string(), 10, 30, "", false);
+        let sub = result.lines().nth(1).unwrap_or("");
+        assert!(
+            !sub.starts_with(" "),
+            "empty sub_prefix should not add spaces, got: {:?}",
+            sub
+        );
+
+        // reset before wrap -> no color carries into sub lines
+        let result =
+            wrap_highlighted_line(format!("\x1b[31mhi\x1b[0m {text}"), 10, 30, "  ", false);
+        for line in result.lines().skip(1) {
+            assert!(
+                !line.contains("\x1b[31m"),
+                "reset color should not carry into sub lines, got: {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_lines_basic() {
+        let ctx = make_ctx();
+        let text = "the quick brown fox jumps over the lazy dog";
+
+        // single line -> same result as wrap_highlighted_line with indent prepended
+        let result = wrap_lines(&ctx, text, false, 0, "", "", false);
+        let expected = wrap_highlighted_line(text.to_string(), 50, 50, "", false);
+        assert_eq!(result, expected);
+
+        // multi_line -> each line wrapped independently
+        let multi = format!("{text}\n{text}");
+        let result = wrap_lines(&ctx, &multi, true, 0, "", "", false);
+        let expected = [text, text]
+            .iter()
+            .map(|line| {
+                wrap_highlighted_line(line.to_string(), 50, 50, "", false)
+                    .trim_matches('\n')
+                    .to_owned()
+            })
+            .join("\n");
+        assert_eq!(result, expected);
+
+        // indent shifts space available and prepends to lines
+        let result = wrap_lines(&ctx, text, false, 2, "", "", false);
+        let expected = wrap_highlighted_line(format!("  {text}"), 46, 46, "  ", false);
+        assert_eq!(result, expected);
+    }
 }

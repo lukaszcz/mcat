@@ -1,13 +1,94 @@
 ## Src
 
+- added math dollars support for the markdown_viewer, just highlights
+- added callout blocks support for the markdown_viewer
+- added better support for qmd files, now treated as markdown
+- added `--toc` flag, for adding a simple table of content in the markdown_viewer
+- fixed an issue in the markdown_viewer where ordered lists weren't auto numbered, now follows CommonMark spec
+
+## V0.6.1
+
+- improved the markdown_viewer wrapping logic
+- fixed markdown_viewer not appending "\n"
+
+## V0.6.0
+
+- added `mermaid` support to the `ls` command
+- added `--timeout` flag, timeout for fetching images from urls, the timeout applies to on connection and per packet, the default is 5s
+- added `rpm` and `deb` packaging for the release!
+- improved the markdown_viewer, now also renders html tables, span with colors and `<u>` `<ins>` `<mark>` `<kbd>` `<ul>` `<ol>` `<li>` `<sup>` tags
+- improved the markdown_viewer, now html is parsed in a more correct way, fixing excessive new lines
+- improved the markdown_viewer, now supports description lists, shortcodes (e.g. `:thumbsup:`), and superscript
+- improved the markdown_viewer, now nested inline formatting (e.g. bold containing highlight) preserves outer styling
+- improved the markdown_viewer, images inside tables now have better logic for their sizing, fixing some images getting wrapped
+- improved the markdown_viewer, should be faster for some markdowns with images
+- improved the `ls` speed, now no longer auto decompressing
+- improved the scraping logic, now does it based on width and height (not content-size) and now also doesn't download candidates (should make it way faster)
+- fixed an issue in the markdown_viewer, that certain images would get splitted
+- fixed an issue in the markdown_viewer, where images with links would be slightly misaligned on the first row on some terminals
+- fixed an issue in the markdown_viewer, where images with width/height containing px, wouldn't be respected
+
+## V0.5.6
+
+- improved the html to image, now upto 3x faster on retries of the same/similar html
+- improved markdownify to be more relaxed, instead of failing it will give fallbacks more often.
+- fixed an regression where text from stdin will not be considered markdown.
+- added `mermaid` support
+
+## V0.5.5
+
+- added support for `JpegXL`
+- improved the image_preprocessor at the markdown_viewer, now 10% faster at rendering multiple images
+- improved queries from url, now detects types using the ext of the url too if exists (now also when the mime type is app)
+- fixed an issue that if an image with the same url will appear multiple times in the markdown_viewer, it will be rendered only once
+- fixed an issue where images with sizes (html) in the markdown_viewer will sometimes not be respected for their sizes, sizes currently only support % and px
+- fixed an issue where using `-o image` the image would be resized, losing image quality.
+- fixed an issue in markdownify where some chars such as ">" won't be rendered into the markdown. effected both docx, opendoc and pptx.
+- fixed an issue where files to image, would just be an image of the file text instead of html rendered
+
+## V0.5.4
+
+- added pdf to the ls command, now pdf are printed as image rather then a stub svg
+- added ghostty loading bar for ghostty users, replaces the previous loading bar for when fetching images from urls
+- added logic to wrap table cells in the markdown_viewer, #63, (@sideshowbarker)
+- improved queries from url, now detects types using the ext of the url too if exists
+- improved the file tree rendering for when there is multiple files
+- fixed an issue where files wouldn't carry over information in the pipeline, e.g. an pdf file would be converted to image, and the original path will be lost and not displayed
+- fixed an issue that made the ls command ignore files in .gitignore
+- fixed an issue in the markdown_viewer where color won't carry over in wrapped lines after a certain format
+- fixed an issue in the markdown_viewer where thematic break would get wrapped in very small screens
+- fixed an issue in the markdown_viewer where wrapping of lists inside other blocky elements like alert will be flawed, #72
+- fixed an issue in the markdown_viewer where html elements inside "`" and "```" would be consumed as html, #70
+- fixed an regression that would make converting an html file to image fail
+
+## V0.5.2
+
+- improved odt,odp to md in markdownify
+- improved docx to md in markdownify
+- improved pptx to md in markdownify
+- fixed regression in markdownify, where zip based formats would be parsed as zip instead of docx for exmp, #71
+
+## V0.5.1
+
+- added `--padding` flag for the markdown viewer, applies horizontal padding
+- added two-face for more file type support for syntax highlighting in the markdown viewer
+- added pure Rust PDF rendering via hayro, no external tools required, #64
+- added images inside archives are now embedded as data URIs for markdown rendering (`--force-embed-images` to force it)
+- added `-v` flag for debug logging
+- added **interactive viewer** vertical centering for images
 - added `scalex` and `scaley` options, for the `--opts` flag
 - added musl build to the CI, #57
 - added support for viewing tar and zip archives with gz and xz compression.
 - added tree view for the **markdown viewer** when viewing multiple files
+- improved error messages from the image encoder
+- improved argument parsing
+- improved **markdownify** now detects file formats via magic bytes, no longer relies solely on file extension, #55
+- improved text decoding no longer assumes UTF-8, #59
 - improved the HTML to image, its now is slightly faster, and produces better images for small content
 - improved the **markdown viewer** rendering, result should feel better formatted. fixes #56, #51
 - improved the **markdown_viewer** wrapping logic, fixes #53
 - improved the **html_preprocessor** for the **markdown_viewer**, now produces well formatted markdown. fixes #51
+- fixed lsix text placement, text was slightly misaligned after a couple of images
 - fixed an issue where color would persist after a simple code block in the **markdown viewer**
 - fixed th break in markdown not wrapping correctly in the **markdown_viewer**
 - fixed an issue in the **html_preprocessor** that caused some tags to not be escaped correctly

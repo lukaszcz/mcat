@@ -1,76 +1,99 @@
 pub mod html_preprocessor;
 pub mod image_preprocessor;
 pub mod render;
-pub mod themes;
 pub mod utils;
 
+use crate::{markdown_viewer::render::build_toc, themes::CustomTheme};
 use comrak::{
     Arena, markdown_to_html_with_plugins, options, plugins::syntect::SyntectAdapterBuilder,
 };
 use image_preprocessor::ImagePreprocessor;
-use rasteroid::term_misc::{self, break_size_string};
+use itertools::Itertools;
 use render::{AnsiContext, RESET, parse_node};
-use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
-use themes::CustomTheme;
+use syntect::highlighting::ThemeSet;
 
-use crate::{UnwrapOrExit, config::McatConfig};
+use crate::config::{McatConfig, Theme};
+use anyhow::{Context, Result};
 use std::path::Path;
 
-pub fn md_to_ansi(md: &str, config: &McatConfig, markdown_file_path: Option<&Path>) -> String {
+pub fn md_to_ansi(
+    md: &str,
+    mut config: McatConfig,
+    markdown_file_path: Option<&Path>,
+) -> Result<String> {
     let md = html_preprocessor::process(md);
 
     let arena = Arena::new();
     let opts = comrak_options();
     let root = comrak::parse_document(&arena, &md, &opts);
 
-    // changing to forced inline in case of images rendered
-    let _ = term_misc::init_wininfo(
-        &break_size_string(&config.inline_options.spx).unwrap_or_exit(),
-        &break_size_string(&config.inline_options.spx).unwrap_or_exit(),
-        config.inline_options.scalex,
-        config.inline_options.scaley,
-        config.is_tmux,
-        true,
-    );
+    let padding = config.padding as usize;
 
-    let ps = SyntaxSet::load_defaults_newlines();
-    let theme = CustomTheme::from(config.theme.as_ref());
-    let image_preprocessor = ImagePreprocessor::new(root, config, markdown_file_path);
+    // changing to forced inline in case of images rendered
+    let wininfo = config
+        .wininfo
+        .as_mut()
+        .context("this is likely a bug, wininfo isn't set at the md_to_ansi")?;
+    wininfo.needs_inline = true;
+    wininfo.sc_width = wininfo.sc_width.saturating_sub((padding * 2) as u16);
+
+    let ps = two_face::syntax::extra_newlines();
+    let theme = config.theme.to_custom();
+    let image_preprocessor = ImagePreprocessor::new(root, &config, markdown_file_path)?;
     let mut ctx = AnsiContext {
         ps,
         theme,
+        wininfo: config.wininfo.unwrap(),
         hide_line_numbers: config.no_linenumbers,
-        term_width: term_misc::get_wininfo().sc_width as usize,
         center: false,
-        image_preprocessor: &image_preprocessor,
-        show_frontmatter: config.yaml_header,
+        image_preprocessor,
+        show_frontmatter: config.header,
 
         blockquote_fenced_offset: None,
-        is_multi_block_quote: false,
-        paragraph_collecting_line: None,
         collecting_depth: 0,
         under_header: false,
         force_simple_code_block: 0,
         list_depth: 0,
     };
 
+    let toc = if config.toc {
+        build_toc(root, &mut ctx)
+    } else {
+        String::new()
+    };
+
     let mut output = String::new();
+    if !toc.is_empty() {
+        output.push_str(&toc);
+        output.push_str("\n\n");
+    }
     output.push_str(&ctx.theme.foreground.fg);
     output.push_str(&parse_node(root, &mut ctx));
 
     let mut res = output.replace(RESET, &format!("{RESET}{}", &ctx.theme.foreground.fg));
 
     // replace images
-    for (_, img) in image_preprocessor.mapper {
+    for (_, img) in ctx.image_preprocessor.mapper {
         img.insert_into_text(&mut res);
     }
-    res
+
+    // apply horizontal padding
+    if padding > 0 {
+        let pad = " ".repeat(padding);
+        res = res.lines().map(|line| format!("{pad}{line}")).join("\n");
+    }
+
+    if !res.ends_with('\n') {
+        res.push('\n');
+    }
+
+    Ok(res)
 }
 
-pub fn md_to_html(markdown: &str, style: Option<&str>) -> String {
+pub fn md_to_html(markdown: &str, theme: &Theme, style: bool) -> String {
     let options = comrak_options();
 
-    let theme = CustomTheme::from(style.unwrap_or_default());
+    let theme = CustomTheme::from(theme);
     let mut theme_set = ThemeSet::load_defaults();
     let mut plugins = options::Plugins::default();
     theme_set
@@ -80,13 +103,13 @@ pub fn md_to_html(markdown: &str, style: Option<&str>) -> String {
         .theme("dark")
         .theme_set(theme_set)
         .build();
-    if style.is_some() {
+    if style {
         plugins.render.codefence_syntax_highlighter = Some(&adapter);
     }
 
     let full_css = match style {
-        Some(_) => Some(theme.to_html_style()),
-        None => None,
+        true => Some(theme.to_html_style()),
+        false => None,
     };
 
     let html = markdown_to_html_with_plugins(markdown, &options, &plugins);
@@ -112,24 +135,28 @@ pub fn md_to_html(markdown: &str, style: Option<&str>) -> String {
 
 fn comrak_options<'a>() -> options::Options<'a> {
     let mut options = options::Options::default();
+
     options.extension.strikethrough = true;
     options.extension.footnotes = true;
     options.extension.front_matter_delimiter = Some("---".to_owned());
     options.extension.superscript = true;
-    options.extension.tagfilter = true;
     options.extension.table = true;
     options.extension.autolink = true;
     options.extension.tasklist = true;
     options.extension.description_lists = true;
     options.extension.math_code = true;
+    options.extension.math_dollars = true;
     options.extension.alerts = true;
     options.extension.wikilinks_title_after_pipe = true;
     options.extension.spoiler = true;
     options.extension.multiline_block_quotes = true;
-
+    options.extension.block_directive = true;
+    options.extension.highlight = true;
     options.parse.smart = true;
     options.parse.relaxed_tasklist_matching = true;
+    options.extension.shortcodes = true;
 
+    options.extension.tagfilter = true;
     options.render.r#unsafe = true;
 
     options
